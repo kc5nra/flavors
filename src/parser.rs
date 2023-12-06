@@ -2,8 +2,8 @@ use std::str::from_utf8;
 
 use nom::bits::bits;
 use nom::bits::streaming::take;
-use nom::bytes::streaming::tag;
-use nom::combinator::{flat_map, map, map_res};
+use nom::bytes::streaming::{tag, take as bytes_take};
+use nom::combinator::{flat_map, map, map_res, peek};
 use nom::error::{Error, ErrorKind};
 use nom::multi::{length_data, many0, many_m_n};
 use nom::number::streaming::{be_f64, be_i16, be_i24, be_u16, be_u24, be_u32, be_u8};
@@ -49,6 +49,7 @@ pub struct TagHeader {
 pub enum TagData<'a> {
   Audio(AudioData<'a>),
   Video(VideoData<'a>),
+  EnhancedVideo(enhanced::VideoData<'a>),
   Script,
 }
 
@@ -103,9 +104,24 @@ pub fn complete_tag(input: &[u8]) -> IResult<&[u8], Tag> {
   })(input)
 }
 
+fn enhanced_video_tag(input: &[u8]) -> IResult<&[u8], bool> {
+  map_res(
+    bits::<_, _, Error<_>, _, _>(take(1usize)),
+    |enhanced_bit: u8| Ok::<_, (&[u8], nom::error::ErrorKind)>(enhanced_bit == 1),
+  )(input)
+}
+
 pub fn tag_data(tag_type: TagType, size: usize) -> impl Fn(&[u8]) -> IResult<&[u8], TagData> {
   move |input| match tag_type {
-    TagType::Video => map(|i| video_data(i, size), TagData::Video)(input),
+    TagType::Video => {
+      let (_, is_enhanced_video_tag) = enhanced_video_tag(input)?;
+
+      if is_enhanced_video_tag {
+        map(|i| enhanced::video_data(i, size), TagData::EnhancedVideo)(input)
+      } else {
+        map(|i| video_data(i, size), TagData::Video)(input)
+      }
+    }
     TagType::Audio => map(|i| audio_data(i, size), TagData::Audio)(input),
     TagType::Script => Ok((input, TagData::Script)),
   }
@@ -413,6 +429,149 @@ pub fn avc_video_packet(input: &[u8], size: usize) -> IResult<&[u8], AVCVideoPac
       },
     )
   })
+}
+
+mod enhanced {
+  use super::*;
+
+  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  pub enum VideoPacketType {
+    SequenceStart,
+    CodedFrames,
+    SequenceEnd,
+    CodedFramesX,
+    Metadata,
+    MPEG2TsSequenceStart,
+    Multitrack,
+  }
+
+  mod fourcc {
+    pub const AV1: &[u8] = b"av01";
+    pub const VP8: &[u8] = b"vp08";
+    pub const VP9: &[u8] = b"vp09";
+    pub const HEVC: &[u8] = b"hvc1";
+    pub const AVC: &[u8] = b"avc1";
+  }
+
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  pub enum FourCc {
+    Av1,
+    Vp8,
+    Vp9,
+    Hevc,
+    Avc,
+  }
+
+  fn video_fourcc(input: &[u8]) -> IResult<&[u8], FourCc> {
+    let fourc_cc = bytes_take(4usize);
+
+    map_res(fourc_cc, |tag_type: &[u8]| {
+      Ok(match tag_type {
+        fourcc::AVC => FourCc::Avc,
+        fourcc::AV1 => FourCc::Av1,
+        fourcc::HEVC => FourCc::Hevc,
+        fourcc::VP8 => FourCc::Vp8,
+        fourcc::VP9 => FourCc::Vp9,
+        _ => return Err(Err::Error(Error::new(input, ErrorKind::Alt))),
+      })
+    })(input)
+  }
+
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  pub enum VideoDataBody<'a> {
+    Command,
+    NonMultitrack(NonMultitrack<'a>),
+    Multitrack,
+    MultitrackManyCodecs,
+  }
+
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  pub struct NonMultitrack<'a> {
+    pub four_cc: FourCc,
+    data: &'a [u8],
+  }
+
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  pub struct VideoData<'a> {
+    header: VideoDataHeader,
+    body: VideoDataBody<'a>,
+  }
+
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  pub struct VideoDataHeader {
+    pub frame_type: FrameType,
+    pub packet_type: VideoPacketType,
+  }
+
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  pub struct EnhancedVideoBody<'a> {
+    pub frame_type: FrameType,
+    pub codec_id: CodecId,
+    pub video_data: &'a [u8],
+  }
+
+  pub fn video_data(input: &[u8], size: usize) -> IResult<&[u8], VideoData> {
+    if input.len() < size {
+      return Err(Err::Incomplete(Needed::new(size)));
+    }
+
+    if size < 1 {
+      return Err(Err::Incomplete(Needed::new(1)));
+    }
+
+    println!("Wooho");
+
+    let take_bits = pair(take(4usize), take(4usize));
+    bits::<_, _, Error<_>, _, _>(take_bits)(input).and_then(
+      |(_, (frame_type, packet_type)): (&[u8], (u8, u8))| {
+        // The top bit was used to discriminate enhanced ertmp
+        let frame_type = match frame_type & 0b111 {
+          1 => FrameType::Key,
+          2 => FrameType::Inter,
+          3 => FrameType::DisposableInter,
+          4 => FrameType::Generated,
+          5 => FrameType::Command,
+          _ => return Err(Err::Error(Error::new(input, ErrorKind::Alt))),
+        };
+
+        let packet_type = match packet_type {
+          0 => VideoPacketType::SequenceStart,
+          1 => VideoPacketType::CodedFrames,
+          2 => VideoPacketType::SequenceEnd,
+          3 => VideoPacketType::CodedFramesX,
+          4 => VideoPacketType::Metadata,
+          5 => VideoPacketType::MPEG2TsSequenceStart,
+          6 => VideoPacketType::Multitrack,
+          _ => return Err(Err::Error(Error::new(input, ErrorKind::Alt))),
+        };
+
+        let header = VideoDataHeader {
+          frame_type,
+          packet_type,
+        };
+
+        let (input, body) = match (frame_type, packet_type) {
+          (FrameType::Command, pt) if pt != VideoPacketType::Metadata => {
+            let (input, _command) = be_u8(&input[1..])?;
+            (input, VideoDataBody::Command)
+          }
+          (_, VideoPacketType::Multitrack) => (input, VideoDataBody::Multitrack),
+          _ => {
+            let (input, four_cc) = video_fourcc(input)?;
+            (
+              input,
+              VideoDataBody::NonMultitrack(NonMultitrack {
+                four_cc,
+                data: input,
+              }),
+            )
+          }
+        };
+
+        Ok((&input[size..], VideoData { header, body }))
+      },
+    )
+  }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
